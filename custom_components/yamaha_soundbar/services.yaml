@@ -190,6 +190,12 @@ sound_settings:
       required: false
       selector:
         boolean:
+    night_mode:
+      name: Night Mode
+      description: Set night mode on or off (SR-X40A/X50A firmware only; not exposed in Yamaha's app)
+      required: false
+      selector:
+        boolean:
 
 play_track:
   name: Play track

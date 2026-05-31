@@ -75,6 +75,7 @@ from homeassistant.const import (
 )
 
 from . import DOMAIN, ATTR_MASTER
+from . import lp_api
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ ATTR_SURROUND = 'surround'
 ATTR_CLEAR_VOICE = 'clear_voice'
 ATTR_BASS_EXTENSION = 'bass_extension'
 ATTR_POWER_SAVING = 'power_saving'
+ATTR_NIGHT_MODE = 'night_mode'
 
 CONF_NAME = 'name'
 CONF_SOURCE_IGNORE = "source_ignore"
@@ -309,6 +311,24 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     finally:
         await websession.close()
 
+    # Newer firmware (SR-X40A / SR-X50A, Qualcomm qcs-evb) has no httpapi.asp
+    # (it 404s). Fall back to the /lp.asp interface to identify the device.
+    lp_firmware = False
+    if state == STATE_UNAVAILABLE:
+        try:
+            info = await lp_api.LinkPlayLpClient(host).get_system_info()
+            if isinstance(info, dict) and info.get("ret") == "succeed":
+                lp_firmware = True
+                state = STATE_IDLE
+                uuid = info.get("uuid", uuid)
+                if name is None:
+                    name = info.get("name") or info.get("DeviceName")
+                _LOGGER.info(
+                    "Yamaha %s: httpapi.asp unavailable, using /lp.asp interface", host
+                )
+        except Exception as error:
+            _LOGGER.debug("Yamaha %s: /lp.asp probe failed: %s", host, error)
+
     yamaha = YamahaDevice(name,
                             host,
                             sources,
@@ -321,7 +341,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
                             lastfm_api_key,
                             uuid,
                             state,
-                            hass)
+                            hass,
+                            lp_firmware)
 
     async_add_entities([yamaha])
 
@@ -341,9 +362,12 @@ class YamahaDevice(MediaPlayerEntity):
                  lastfm_api_key,
                  uuid,
                  state,
-                 hass):
+                 hass,
+                 lp_firmware=False):
         """Initialize the media player."""
         self._uuid = uuid
+        self._lp_firmware = lp_firmware
+        self._lp = lp_api.LinkPlayLpClient(host) if lp_firmware else None
         self._fw_ver = '1.0.0'
         self._mcu_ver = ''
         requester = AiohttpRequester(UPNP_TIMEOUT)
@@ -566,9 +590,140 @@ class YamahaDevice(MediaPlayerEntity):
     async def async_trigger_schedule_update(self, before):
         await self.async_schedule_update_ha_state(before)
 
+    async def _async_ensure_upnp(self):
+        """Create the UPnP device handle once (used by the lp.asp firmware path)."""
+        if self._upnp_device is None:
+            url = "http://{0}:49152/description.xml".format(self._host)
+            try:
+                self._upnp_device = await self._factory.async_create_device(url)
+            except Exception as error:
+                _LOGGER.warning(
+                    "Failed communicating with Yamaha (UPnP) '%s': %s (%s)",
+                    self._name, type(error).__name__, error,
+                )
+
+    async def _async_update_lp(self):
+        """Update state for newer (SR-X40A/X50A) firmware via /lp.asp + UPnP.
+
+        These bars have no httpapi.asp, so playback state/volume come from the
+        standard UPnP AVTransport/RenderingControl services and the sound
+        settings come from the /lp.asp interface (see lp_api.py).
+        """
+        await self._async_ensure_upnp()
+
+        # Sound settings (sound program, input, and the toggle states).
+        should_refresh_sound_data = (
+            self._sound_statdata_updated_at is None
+            or utcnow() > (self._sound_statdata_updated_at + SOUND_DATA_INTERVAL)
+        )
+        if should_refresh_sound_data:
+            sound_setting = await self._lp.get_sound_setting()
+            if isinstance(sound_setting, dict):
+                program = lp_api.program_from_read(sound_setting.get('soundProgram'))
+                # Mirror the key names the httpapi path uses so
+                # extra_state_attributes works unchanged, plus night mode.
+                self._sound_statdata = {
+                    'sound program': program,
+                    'clear voice': lp_api.coerce_bool(sound_setting.get('clearVoice')),
+                    'bass extension': lp_api.coerce_bool(sound_setting.get('bassExtension')),
+                    'power saving': lp_api.coerce_bool(sound_setting.get('powerSaving')),
+                    'night mode': lp_api.coerce_bool(sound_setting.get('nightMode')),
+                }
+                self._sound_mode = program
+                if sound_setting.get('soundPath'):
+                    self._source = sound_setting.get('soundPath')
+            self._sound_statdata_updated_at = utcnow()
+
+        # Volume / mute / transport state via UPnP.
+        await self._async_update_lp_volume()
+        await self._async_update_lp_transport()
+
+        # Now-playing metadata reuses the existing UPnP helper.
+        if self._upnp_device is not None:
+            try:
+                await self.async_update_via_upnp()
+            except Exception as error:
+                _LOGGER.debug("lp UPnP metadata update failed for %s: %s", self.entity_id, error)
+
+        self._position_updated_at = utcnow()
+        self._first_update = False
+
+    async def _async_update_lp_volume(self):
+        """Read volume/mute from UPnP RenderingControl (lp.asp firmware)."""
+        if self._upnp_device is None:
+            return
+        try:
+            rc = self._upnp_device.service('urn:schemas-upnp-org:service:RenderingControl:1')
+            volume = await rc.action('GetVolume').async_call(InstanceID=0, Channel='Master')
+            self._volume = volume.get('CurrentVolume', self._volume)
+            mute = await rc.action('GetMute').async_call(InstanceID=0, Channel='Master')
+            self._muted = bool(int(mute.get('CurrentMute', 0)))
+        except Exception as error:
+            _LOGGER.debug("lp UPnP volume read failed for %s: %s", self.entity_id, error)
+
+    async def _async_update_lp_transport(self):
+        """Read transport state from UPnP AVTransport (lp.asp firmware)."""
+        if self._upnp_device is None:
+            self._state = STATE_IDLE
+            return
+        try:
+            at = self._upnp_device.service('urn:schemas-upnp-org:service:AVTransport:1')
+            info = await at.action('GetTransportInfo').async_call(InstanceID=0)
+            transport_state = info.get('CurrentTransportState')
+            if self._state == STATE_OFF and transport_state in (None, 'STOPPED', 'NO_MEDIA_PRESENT'):
+                # power-saving "off" was set locally; keep it until playback resumes
+                return
+            self._state = {
+                'PLAYING': STATE_PLAYING,
+                'TRANSITIONING': STATE_PLAYING,
+                'PAUSED_PLAYBACK': STATE_PAUSED,
+                'STOPPED': STATE_IDLE,
+                'NO_MEDIA_PRESENT': STATE_IDLE,
+            }.get(transport_state, STATE_IDLE)
+        except Exception as error:
+            _LOGGER.debug("lp UPnP transport read failed for %s: %s", self.entity_id, error)
+            self._state = STATE_IDLE
+
+    async def _async_lp_upnp_transport_call(self, action, **kwargs):
+        """Invoke a UPnP AVTransport action (Play/Pause/Stop/Next/Previous)."""
+        await self._async_ensure_upnp()
+        if self._upnp_device is None:
+            return False
+        try:
+            at = self._upnp_device.service('urn:schemas-upnp-org:service:AVTransport:1')
+            await at.action(action).async_call(InstanceID=0, **kwargs)
+            return True
+        except Exception as error:
+            _LOGGER.warning("lp UPnP %s failed for %s: %s", action, self.entity_id, error)
+            return False
+
+    async def _async_lp_confirm_sound(self, key, want, tries=10):
+        """Poll getSoundSetting until `key` reads `want` (sets apply async)."""
+        for attempt in range(tries):
+            setting = await self._lp.get_sound_setting()
+            if isinstance(setting, dict):
+                self._sound_statdata = {
+                    'sound program': lp_api.program_from_read(setting.get('soundProgram')),
+                    'clear voice': lp_api.coerce_bool(setting.get('clearVoice')),
+                    'bass extension': lp_api.coerce_bool(setting.get('bassExtension')),
+                    'power saving': lp_api.coerce_bool(setting.get('powerSaving')),
+                    'night mode': lp_api.coerce_bool(setting.get('nightMode')),
+                }
+                self._sound_statdata_updated_at = utcnow()
+                if self._sound_statdata.get(key) == want:
+                    return True
+            await asyncio.sleep(0.15 * (attempt + 1))
+        return False
+
     async def async_update(self):
         """Update state."""
         #_LOGGER.debug("01 Start update %s, %s", self.entity_id, self._name)
+        if self._lp_firmware:
+            # Newer firmware (SR-X40A/X50A): no httpapi.asp. State, volume and
+            # transport come from UPnP; sound settings from the /lp.asp API.
+            await self._async_update_lp()
+            return True
+
         if self._master is None:
             self._slave_mode = False
 
@@ -1010,6 +1165,8 @@ class YamahaDevice(MediaPlayerEntity):
     @property
     def sound_mode_list(self):
         """Return the available sound modes."""
+        if self._lp_firmware:
+            return list(lp_api.SOUND_PROGRAMS)
         return sorted(list(SOUND_MODES.values()))
 
     @property
@@ -1232,6 +1389,8 @@ class YamahaDevice(MediaPlayerEntity):
                 attributes[ATTR_BASS_EXTENSION] = _as_bool_or_raw(self._sound_statdata['bass extension'])
             if 'power saving' in self._sound_statdata:
                 attributes[ATTR_POWER_SAVING] = _as_bool_or_raw(self._sound_statdata['power saving'])
+            if 'night mode' in self._sound_statdata:
+                attributes[ATTR_NIGHT_MODE] = _as_bool_or_raw(self._sound_statdata['night mode'])
 
         if DEBUGSTR_ATTR:
             atrdbg = ""
@@ -1292,6 +1451,9 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_media_next_track(self):
         """Send media_next command to media player."""
+        if self._lp_firmware:
+            await self._async_lp_upnp_transport_call('Next')
+            return
         if not self._slave_mode:
             if not self._playing_mass:
                 value = await self.async_call_yamaha_httpapi("setPlayerCmd:next", None)
@@ -1308,6 +1470,9 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_media_previous_track(self):
         """Send media_previous command to media player."""
+        if self._lp_firmware:
+            await self._async_lp_upnp_transport_call('Previous')
+            return
         if not self._slave_mode:
             if not self._playing_mass:
                 value = await self.async_call_yamaha_httpapi("setPlayerCmd:prev", None)
@@ -1324,6 +1489,10 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_media_play(self):
         """Send media_play command to media player."""
+        if self._lp_firmware:
+            if await self._async_lp_upnp_transport_call('Play', Speed='1'):
+                self._state = STATE_PLAYING
+            return
         if not self._slave_mode:
             if self._state == STATE_PAUSED:
                 value = await self.async_call_yamaha_httpapi("setPlayerCmd:resume", None)
@@ -1360,6 +1529,10 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_media_pause(self):
         """Send media_pause command to media player."""
+        if self._lp_firmware:
+            if await self._async_lp_upnp_transport_call('Pause'):
+                self._state = STATE_PAUSED
+            return
         if not self._slave_mode:
             if self._playing_stream and not (self._playing_mediabrowser or self._playing_mass):
                 # Pausing a live stream will cause a buffer overrun in hardware. Stop is the correct procedure in this case.
@@ -1386,6 +1559,10 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_media_stop(self):
         """Send stop command."""
+        if self._lp_firmware:
+            if await self._async_lp_upnp_transport_call('Stop'):
+                self._state = STATE_IDLE
+            return
         if not self._slave_mode:
 
             if self._playing_spotify or self._playing_liveinput:
@@ -1658,6 +1835,14 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_select_sound_mode(self, sound_mode):
         """Set Sound Mode for device."""
+        if self._lp_firmware:
+            # On these bars "sound mode" is the sound program (STEREO/SURROUND/ALL MODE).
+            await self._lp.set_sound_program(sound_mode)
+            if await self._async_lp_confirm_sound('sound program', sound_mode):
+                self._sound_mode = sound_mode
+            else:
+                _LOGGER.warning("Failed to set sound program '%s' on %s", sound_mode, self.entity_id)
+            return
         if not self._slave_mode:
             mode = list(SOUND_MODES.keys())[list(
                 SOUND_MODES.values()).index(sound_mode)]
@@ -1707,6 +1892,22 @@ class YamahaDevice(MediaPlayerEntity):
         else:
             await self._master.async_set_repeat(repeat)
 
+    async def _async_lp_set_volume(self, volume):
+        """Set absolute volume (0..100) via UPnP RenderingControl (lp.asp firmware)."""
+        await self._async_ensure_upnp()
+        if self._upnp_device is None:
+            return False
+        try:
+            rc = self._upnp_device.service('urn:schemas-upnp-org:service:RenderingControl:1')
+            await rc.action('SetVolume').async_call(
+                InstanceID=0, Channel='Master', DesiredVolume=int(volume)
+            )
+            self._volume = int(volume)
+            return True
+        except Exception as error:
+            _LOGGER.warning("lp UPnP SetVolume failed for %s: %s", self.entity_id, error)
+            return False
+
     async def async_volume_up(self):
         """Increase volume one step"""
         if int(self._volume) == 100 and not self._muted:
@@ -1715,6 +1916,10 @@ class YamahaDevice(MediaPlayerEntity):
         volume = int(self._volume) + int(self._volume_step)
         if volume > 100:
             volume = 100
+
+        if self._lp_firmware:
+            await self._async_lp_set_volume(volume)
+            return
 
         value = await self.async_call_yamaha_httpapi("setPlayerCmd:vol:{0}".format(str(volume)), None)
 
@@ -1730,6 +1935,10 @@ class YamahaDevice(MediaPlayerEntity):
         if volume < 0:
             volume = 0
 
+        if self._lp_firmware:
+            await self._async_lp_set_volume(volume)
+            return
+
         value = await self.async_call_yamaha_httpapi("setPlayerCmd:vol:{0}".format(str(volume)), None)
 
         if value == "OK":
@@ -1738,6 +1947,10 @@ class YamahaDevice(MediaPlayerEntity):
     async def async_set_volume_level(self, volume):
         """Set volume level, input range 0..1, yamaha device 0..100."""
         volume = str(round(int(volume * MAX_VOL)))
+        if self._lp_firmware:
+            await self._async_lp_set_volume(volume)
+            return
+
         value = await self.async_call_yamaha_httpapi("setPlayerCmd:vol:{0}".format(str(volume)), None)
 
         if value == "OK":
@@ -1745,6 +1958,19 @@ class YamahaDevice(MediaPlayerEntity):
 
     async def async_mute_volume(self, mute):
         """Mute (true) or unmute (false) media player."""
+        if self._lp_firmware:
+            await self._async_ensure_upnp()
+            if self._upnp_device is not None:
+                try:
+                    rc = self._upnp_device.service('urn:schemas-upnp-org:service:RenderingControl:1')
+                    await rc.action('SetMute').async_call(
+                        InstanceID=0, Channel='Master', DesiredMute=int(mute)
+                    )
+                    self._muted = bool(int(mute))
+                except Exception as error:
+                    _LOGGER.warning("lp UPnP SetMute failed for %s: %s", self.entity_id, error)
+            return
+
         value = await self.async_call_yamaha_httpapi("setPlayerCmd:mute:{0}".format(str(int(mute))), None)
 
         if value == "OK":
@@ -2715,6 +2941,29 @@ class YamahaDevice(MediaPlayerEntity):
         bass_extension = settings.get('bass_extension', None)
         mute = settings.get('mute', None)
         power_saving = settings.get('power_saving', None)
+        night_mode = settings.get('night_mode', None)
+
+        if self._lp_firmware:
+            # Newer firmware (SR-X40A/X50A) uses the /lp.asp soundSetting API.
+            if sound_program is not None:
+                await self.async_select_sound_mode(sound_program)
+            if clear_voice is not None:
+                await self._lp.set_toggle('clearVoice', bool(clear_voice))
+            if bass_extension is not None:
+                await self._lp.set_toggle('bassExtension', bool(bass_extension))
+            if power_saving is not None:
+                await self._lp.set_toggle('powerSaving', bool(power_saving))
+            if night_mode is not None:
+                await self._lp.set_toggle('nightMode', bool(night_mode))
+            if subwoofer_volume is not None:
+                # Note: this firmware's subwoofer range is 0..10 (not -4..4).
+                await self._lp.set_subwoofer_volume(int(subwoofer_volume))
+            if mute is not None:
+                await self.async_mute_volume(bool(mute))
+            # Force a sound-state refresh on the next update cycle.
+            self._sound_statdata_updated_at = None
+            return
+
         cmd = "YAMAHA_DATA_SET:{"
         end = '}'
         sentences = []
