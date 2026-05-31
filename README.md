@@ -6,6 +6,8 @@ This component allows you to control Yamaha soundbar.
 
 Tested on Yamaha YAS-109 & YAS-209, any Yamaha soundbar based on Linkplay A118 should be supported as well. (These include ATS-1090, ATS-2090, SR-X40A, SR-X50A, ATS-X500, Please make an issue in Github if you have a different model and it's not working, or even better if it is, so we can update the compatibility list.)
 
+> **Newer firmware (SR-X40A / SR-X50A):** these bars drop the `httpapi.asp` interface and use a `/lp.asp` JSON-RPC interface instead. The integration auto-detects this at startup and switches to it — no extra configuration needed. On these models the sound programs are `STEREO` / `SURROUND` / `ALL MODE`, volume and transport run over UPnP, and a `night_mode` option is available in the `sound_settings` service (a capability Yamaha's own app and remote don't expose).
+
 ## Installation
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=osk2&repository=yamaha-soundbar&category=integration)
